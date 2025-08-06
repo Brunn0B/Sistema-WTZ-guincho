@@ -9,6 +9,7 @@ Antes de executar o sistema, instale as seguintes dependências:
 ```bash
 npm init -y
 npm install express socket.io whatsapp-web.js qrcode uuid ngrok sharp dotenv cors
+npm install whatsapp-web.js qrcode express socket.io ngrok sharp multer uuid body-parser
 ```
 
 ### 2. Dependências Opcionais (Recomendadas para Produção)
