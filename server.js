@@ -9,6 +9,9 @@ const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
 const ngrok = require('ngrok');
 const sharp = require('sharp');
+const bodyParser = require('body-parser');
+const multer = require('multer');
+const { exec } = require('child_process');
 
 // Configuração do Servidor
 const app = express();
@@ -26,13 +29,48 @@ if (!fs.existsSync(UPLOAD_DIR)) {
     fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 }
 
+// Configuração do Multer para upload de arquivos
+const storage = multer.diskStorage({
+    destination: (req, file, cb) => {
+        cb(null, UPLOAD_DIR);
+    },
+    filename: (req, file, cb) => {
+        const ext = file.originalname.split('.').pop();
+        cb(null, `${uuidv4()}.${ext}`);
+    }
+});
+
+const upload = multer({ 
+    storage: storage,
+    limits: { fileSize: 15 * 1024 * 1024 } // 15MB
+});
+
 // Variáveis globais
 let whatsappClient = null;
 let isAuthenticated = false;
 const activeChats = new Map();
 let ngrokUrl = null;
+let botConfig = {
+    status: 'active',
+    greeting: "Olá! Bem-vindo ao atendimento de guincho. Como posso ajudar?",
+    farewell: "Obrigado por entrar em contato. Tenha um bom dia!",
+    autoReplies: [
+        {
+            trigger: "preço",
+            content: "O valor do serviço de guincho varia conforme a distância. Para um orçamento preciso, por favor informe seu endereço."
+        },
+        {
+            trigger: "horário",
+            content: "Atendemos 24 horas por dia, 7 dias por semana, incluindo feriados."
+        },
+        {
+            trigger: "emergência",
+            content: "Para situações de emergência, por favor informe sua localização exata e o modelo do veículo para priorizarmos seu atendimento."
+        }
+    ]
+};
 
-// Função para inicializar o cliente WhatsApp
+// Inicializar cliente WhatsApp
 const initWhatsAppClient = () => {
     // Destruir instância anterior se existir
     if (whatsappClient) {
@@ -199,6 +237,34 @@ const setupWhatsAppEvents = () => {
             // Marcar como lido se não for minha mensagem
             if (!msg.fromMe) {
                 await chat.sendSeen();
+                
+                // Verificar respostas automáticas
+                if (botConfig.status === 'active') {
+                    const autoReply = botConfig.autoReplies.find(reply => 
+                        msg.body.toLowerCase().includes(reply.trigger.toLowerCase())
+                    );
+                    
+                    if (autoReply) {
+                        setTimeout(async () => {
+                            await whatsappClient.sendMessage(chatId, autoReply.content);
+                            io.emit('auto-reply', {
+                                chatId,
+                                message: autoReply.content
+                            });
+                        }, 1500); // Pequeno atraso para parecer mais natural
+                    }
+                }
+                
+                // Enviar saudação automática se for a primeira mensagem
+                if (chatData.unread === 1 && botConfig.status === 'active') {
+                    setTimeout(async () => {
+                        await whatsappClient.sendMessage(chatId, botConfig.greeting);
+                        io.emit('auto-reply', {
+                            chatId,
+                            message: botConfig.greeting
+                        });
+                    }, 1000);
+                }
             }
         } catch (err) {
             console.error('Erro ao processar mensagem:', err);
@@ -225,8 +291,8 @@ const setupWhatsAppEvents = () => {
 // Middlewares
 app.use(express.static(path.join(__dirname, 'public')));
 app.use('/uploads', express.static(UPLOAD_DIR));
-app.use(express.json({ limit: '15mb' }));
-app.use(express.urlencoded({ extended: true, limit: '15mb' }));
+app.use(bodyParser.json({ limit: '15mb' }));
+app.use(bodyParser.urlencoded({ extended: true, limit: '15mb' }));
 
 // Rotas
 app.get('/', (req, res) => {
@@ -235,6 +301,18 @@ app.get('/', (req, res) => {
 
 app.get('/ngrok-url', (req, res) => {
     res.json({ url: ngrokUrl });
+});
+
+// Rota para upload de arquivos
+app.post('/upload', upload.single('file'), (req, res) => {
+    if (!req.file) {
+        return res.status(400).json({ error: 'Nenhum arquivo enviado' });
+    }
+    
+    res.json({
+        url: `/uploads/${req.file.filename}`,
+        name: req.file.originalname
+    });
 });
 
 // Socket.io
@@ -255,6 +333,9 @@ io.on('connection', (socket) => {
     if (ngrokUrl) {
         socket.emit('ngrok-url', ngrokUrl);
     }
+
+    // Enviar configurações do bot
+    socket.emit('bot-config', botConfig);
 
     // Iniciar cliente se não estiver rodando
     if (!whatsappClient) {
@@ -380,17 +461,18 @@ io.on('connection', (socket) => {
 
         try {
             // Criar mídia
-            const media = new MessageMedia(file.mimetype, file.data, file.filename);
+            const media = new MessageMedia(file.mimetype, file.data, file.name);
             
             // Enviar arquivo
             const sentMsg = await whatsappClient.sendMessage(chatId, media, {
-                caption: file.filename
+                caption: file.name
             });
             
             // Gerar URL do arquivo
-            const fileUrl = `/uploads/${file.filename}`;
-            const filePath = path.join(UPLOAD_DIR, file.filename);
+            const fileName = `${uuidv4()}.${file.name.split('.').pop()}`;
+            const filePath = path.join(UPLOAD_DIR, fileName);
             fs.writeFileSync(filePath, Buffer.from(file.data, 'base64'));
+            const fileUrl = `/uploads/${fileName}`;
             
             // Atualizar chat
             if (activeChats.has(chatId)) {
@@ -407,7 +489,7 @@ io.on('connection', (socket) => {
             // Emitir confirmação
             socket.emit('file-uploaded', {
                 chatId,
-                fileName: file.filename,
+                fileName: file.name,
                 fileUrl,
                 timestamp: new Date(sentMsg.timestamp * 1000).toISOString()
             });
@@ -424,16 +506,60 @@ io.on('connection', (socket) => {
         }
     });
 
+    // Evento: Atualizar configurações do bot
+    socket.on('update-bot-config', (config) => {
+        botConfig = config;
+        fs.writeFileSync(path.join(__dirname, 'bot-config.json'), JSON.stringify(config, null, 2));
+        io.emit('bot-config-updated', config);
+    });
+
+    // Evento: Transcrever áudio
+    socket.on('transcribe-audio', async ({ audioData }, callback) => {
+        try {
+            // Em produção, integrar com uma API de transcrição real como Whisper, Google Speech, etc.
+            // Esta é uma simulação que retorna uma transcrição aleatória após um atraso
+            
+            const mockTranscriptions = [
+                "Preciso de um guincho para meu carro quebrado na avenida principal.",
+                "Meu carro quebrou na rua das flores, preciso de socorro.",
+                "Qual o valor do guincho para um carro médio?",
+                "Estou com o carro avariado na marginal, preciso de ajuda.",
+                "O guincho está a caminho? Já faz meia hora que solicitei."
+            ];
+            
+            setTimeout(() => {
+                const randomText = mockTranscriptions[Math.floor(Math.random() * mockTranscriptions.length)];
+                callback({ success: true, text: randomText });
+            }, 2000);
+        } catch (err) {
+            console.error('Erro na transcrição:', err);
+            callback({ success: false, error: 'Falha na transcrição' });
+        }
+    });
+
     // Desconexão do socket
     socket.on('disconnect', () => {
         console.log('Cliente desconectado:', socket.id);
     });
 });
 
+// Carregar configurações do bot
+function loadBotConfig() {
+    try {
+        if (fs.existsSync(path.join(__dirname, 'bot-config.json'))) {
+            const data = fs.readFileSync(path.join(__dirname, 'bot-config.json'), 'utf8');
+            botConfig = JSON.parse(data);
+        }
+    } catch (err) {
+        console.error('Erro ao carregar configurações do bot:', err);
+    }
+}
+
 // Iniciar servidor
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, async () => {
     console.log(`Servidor rodando na porta ${PORT}`);
+    loadBotConfig();
     initWhatsAppClient();
     
     try {
